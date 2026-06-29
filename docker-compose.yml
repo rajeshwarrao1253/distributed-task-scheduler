@@ -1,0 +1,194 @@
+version: "3.9"
+
+# =============================================================================
+# Distributed Task Scheduler - Docker Compose
+# =============================================================================
+# Services:
+#   - scheduler: HTTP API + cron engine + queue management
+#   - worker-1, worker-2: Job processing workers
+#   - redis: Queue storage, distributed locks, heartbeats
+#   - postgres: Persistent job storage, history, audit log
+# =============================================================================
+
+services:
+  # ---------------------------------------------------------------------------
+  # PostgreSQL - Durable job persistence
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:15-alpine
+    container_name: scheduler-postgres
+    environment:
+      POSTGRES_USER: scheduler
+      POSTGRES_PASSWORD: scheduler_pass
+      POSTGRES_DB: taskscheduler
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U scheduler -d taskscheduler"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - scheduler-network
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Redis - Queue, locks, heartbeats, metrics
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: scheduler-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    networks:
+      - scheduler-network
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Scheduler - HTTP API + cron engine
+  # ---------------------------------------------------------------------------
+  scheduler:
+    build:
+      context: .
+      target: scheduler
+    container_name: scheduler-node
+    environment:
+      REDIS_ADDR: redis:6379
+      REDIS_PASSWORD: ""
+      REDIS_DB: "0"
+      POSTGRES_DSN: postgres://scheduler:scheduler_pass@postgres:5432/taskscheduler?sslmode=disable
+      SCHEDULER_HTTP_ADDR: :8080
+      METRICS_ADDR: :9090
+      LOG_LEVEL: info
+    ports:
+      - "8080:8080"
+      - "9090:9090"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - scheduler-network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 256M
+        reservations:
+          cpus: "0.25"
+          memory: 64M
+
+  # ---------------------------------------------------------------------------
+  # Worker 1
+  # ---------------------------------------------------------------------------
+  worker-1:
+    build:
+      context: .
+      target: worker
+    container_name: scheduler-worker-1
+    environment:
+      REDIS_ADDR: redis:6379
+      REDIS_PASSWORD: ""
+      REDIS_DB: "0"
+      POSTGRES_DSN: postgres://scheduler:scheduler_pass@postgres:5432/taskscheduler?sslmode=disable
+      WORKER_CONCURRENCY: "10"
+      WORKER_POLL_INTERVAL: "1s"
+      WORKER_HEARTBEAT_INTERVAL: "10s"
+      JOB_MAX_RETRIES: "3"
+      JOB_TIMEOUT_MS: "30000"
+      METRICS_ADDR: ""
+      WORKER_ID: worker-1
+      LOG_LEVEL: info
+    depends_on:
+      - scheduler
+    networks:
+      - scheduler-network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 128M
+        reservations:
+          cpus: "0.125"
+          memory: 32M
+
+  # ---------------------------------------------------------------------------
+  # Worker 2
+  # ---------------------------------------------------------------------------
+  worker-2:
+    build:
+      context: .
+      target: worker
+    container_name: scheduler-worker-2
+    environment:
+      REDIS_ADDR: redis:6379
+      REDIS_PASSWORD: ""
+      REDIS_DB: "0"
+      POSTGRES_DSN: postgres://scheduler:scheduler_pass@postgres:5432/taskscheduler?sslmode=disable
+      WORKER_CONCURRENCY: "10"
+      WORKER_POLL_INTERVAL: "1s"
+      WORKER_HEARTBEAT_INTERVAL: "10s"
+      JOB_MAX_RETRIES: "3"
+      JOB_TIMEOUT_MS: "30000"
+      METRICS_ADDR: ""
+      WORKER_ID: worker-2
+      LOG_LEVEL: info
+    depends_on:
+      - scheduler
+    networks:
+      - scheduler-network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 128M
+        reservations:
+          cpus: "0.125"
+          memory: 32M
+
+  # ---------------------------------------------------------------------------
+  # Prometheus (optional monitoring stack)
+  # ---------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v2.50.0
+    container_name: scheduler-prometheus
+    ports:
+      - "9091:9090"
+    volumes:
+      - ./docs/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.console.libraries=/etc/prometheus/console_libraries"
+      - "--web.console.templates=/etc/prometheus/consoles"
+    networks:
+      - scheduler-network
+    profiles:
+      - monitoring
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+
+networks:
+  scheduler-network:
+    driver: bridge
