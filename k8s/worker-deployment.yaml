@@ -1,0 +1,164 @@
+# =============================================================================
+# Worker Deployment with Horizontal Pod Autoscaler (HPA)
+# =============================================================================
+# Workers consume jobs from the queue and execute them. They are stateless
+# and designed to scale horizontally based on queue depth and CPU usage.
+#
+# Resources:
+#   - Deployment: Manages worker pod replicas
+#   - HorizontalPodAutoscaler: Auto-scales based on CPU and custom metrics
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: task-worker
+  namespace: default
+  labels:
+    app: task-scheduler
+    component: worker
+    version: v1
+spec:
+  replicas: 3  # Initial replica count; HPA will adjust this
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 2
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: task-scheduler
+      component: worker
+  template:
+    metadata:
+      labels:
+        app: task-scheduler
+        component: worker
+        version: v1
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+    spec:
+      terminationGracePeriodSeconds: 120  # Workers need time to finish in-flight jobs
+      containers:
+        - name: worker
+          image: task-worker:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+          env:
+            - name: REDIS_ADDR
+              value: "redis:6379"
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: scheduler-secrets
+                  key: redis-password
+                  optional: true
+            - name: REDIS_DB
+              value: "0"
+            - name: POSTGRES_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: scheduler-secrets
+                  key: postgres-dsn
+            - name: WORKER_CONCURRENCY
+              value: "10"
+            - name: WORKER_POLL_INTERVAL
+              value: "1s"
+            - name: WORKER_HEARTBEAT_INTERVAL
+              value: "10s"
+            - name: WORKER_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: JOB_MAX_RETRIES
+              value: "3"
+            - name: JOB_TIMEOUT_MS
+              value: "30000"
+            - name: LOG_LEVEL
+              value: "info"
+          resources:
+            requests:
+              memory: "32Mi"
+              cpu: "100m"
+            limits:
+              memory: "128Mi"
+              cpu: "500m"
+          livenessProbe:
+            exec:
+              command:
+                - "/worker"
+                - "-health-check"
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep 30"]  # Allow in-flight jobs to complete
+---
+# =============================================================================
+# Horizontal Pod Autoscaler
+# =============================================================================
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: task-worker-hpa
+  namespace: default
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: task-worker
+  minReplicas: 2
+  maxReplicas: 50
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Pods
+          value: 4
+          periodSeconds: 60
+        - type: Percent
+          value: 100
+          periodSeconds: 60
+      selectPolicy: Max
+    scaleDown:
+      stabilizationWindowSeconds: 300  # 5 minutes before scaling down
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 120
+      selectPolicy: Min
+---
+# =============================================================================
+# PodDisruptionBudget - Ensures minimum availability during disruptions
+# =============================================================================
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: task-worker-pdb
+  namespace: default
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: task-scheduler
+      component: worker
